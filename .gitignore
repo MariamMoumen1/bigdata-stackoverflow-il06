@@ -5,3 +5,6 @@ __pycache__/
 .env.local
 .ivy2/
 .env
+
+data/raw/
+data/*.jsonl
