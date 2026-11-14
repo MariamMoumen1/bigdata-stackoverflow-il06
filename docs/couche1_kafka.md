@@ -17,3 +17,5 @@ Questions.csv et Tags.csv de StackSample, places dans data/ (ignores par Git). L
 
 - Test de la chaine : 500 questions.
 - Version finale : 50000 questions, verifiees dans Kafka (offsets = 50000).
+
+Note : le topic actuel a 1 partition ; run_all.sh en cree 3 sur une plateforme neuve.
