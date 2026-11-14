@@ -12,3 +12,8 @@ Questions.csv et Tags.csv de StackSample, places dans data/ (ignores par Git). L
 2. .\scripts\create_topic.ps1
 3. lancer le producteur (voir README)
 4. .\scripts\check_offsets.ps1
+
+## Historique des volumes
+
+- Test de la chaine : 500 questions.
+- Version finale : 50000 questions, verifiees dans Kafka (offsets = 50000).
