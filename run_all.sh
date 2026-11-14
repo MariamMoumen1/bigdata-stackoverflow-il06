@@ -6,6 +6,10 @@ cd "$(dirname "$0")"
 echo "==> 1/5 Demarrage des services Docker (premier lancement : 10-20 min)"
 docker compose up -d --build
 
+echo "==> Creation du topic Kafka 'questions'"
+until docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list > /dev/null 2>&1; do sleep 3; done
+docker compose exec -T kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create --if-not-exists --topic questions --partitions 3 --replication-factor 1
+
 echo "==> 2/5 Attente d'Airflow"
 until curl -sf http://localhost:8080/health > /dev/null; do sleep 5; done
 until docker compose exec -T airflow airflow dags list 2>/dev/null | grep -q stackoverflow_monthly; do sleep 5; done
