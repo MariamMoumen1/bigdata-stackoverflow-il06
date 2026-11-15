@@ -21,9 +21,16 @@ services:
       - kafka_data:/var/lib/kafka/data
 
   minio:
-    image: minio/minio:latest
+    image: alpine:3.19
     container_name: minio
-    command: server /data --console-address ":9001"
+    command: >
+      /bin/sh -c "
+      if [ ! -f /usr/local/bin/minio ]; then
+        wget -q -O /usr/local/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio &&
+        chmod +x /usr/local/bin/minio;
+      fi &&
+      /usr/local/bin/minio server /data --console-address ':9001'
+      "
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -34,15 +41,21 @@ services:
       - minio_data:/data
 
   minio-init:
-    image: minio/mc:latest
+    image: alpine:3.19
     depends_on:
       - minio
     restart: "no"
+    environment:
+      MINIO_USER: ${MINIO_USER}
+      MINIO_PASSWORD: ${MINIO_PASSWORD}
     entrypoint: >
       /bin/sh -c "
-      until mc alias set local http://minio:9000 ${MINIO_USER} ${MINIO_PASSWORD}; do sleep 2; done;
-      mc mb -p local/bronze local/silver local/gold;
-      exit 0;"
+      wget -q -O /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc &&
+      chmod +x /usr/local/bin/mc &&
+      until /usr/local/bin/mc alias set local http://minio:9000 $$MINIO_USER $$MINIO_PASSWORD; do sleep 2; done;
+      /usr/local/bin/mc mb -p local/bronze local/silver local/gold;
+      exit 0;
+      "
 
   airflow:
     build: ./airflow
