@@ -21,7 +21,7 @@ services:
       - kafka_data:/var/lib/kafka/data
 
   minio:
-    image: minio/minio:latest
+    image: pgsty/silo:latest
     container_name: minio
     command: server /data --console-address ":9001"
     ports:
@@ -34,15 +34,20 @@ services:
       - minio_data:/data
 
   minio-init:
-    image: minio/mc:latest
+    image: amazon/aws-cli:latest
     depends_on:
       - minio
     restart: "no"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD}
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: >
       /bin/sh -c "
-      until mc alias set local http://minio:9000 ${MINIO_USER} ${MINIO_PASSWORD}; do sleep 2; done;
-      mc mb -p local/bronze local/silver local/gold;
-      exit 0;"
+      until aws --endpoint-url http://minio:9000 s3 ls; do sleep 2; done;
+      for b in bronze silver gold; do aws --endpoint-url http://minio:9000 s3 mb s3://$$b || true; done;
+      exit 0;
+      "
 
   airflow:
     build: ./airflow
