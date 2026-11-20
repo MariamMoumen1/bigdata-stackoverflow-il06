@@ -1,33 +1,38 @@
-"""MODELE : prediction des tags a partir du texte. TF-IDF + une regression logistique par tag (One-vs-Rest multi-etiquettes)."""
+"""MODELE : prediction des tags a partir du texte.
+One-vs-Rest multi-etiquettes (Mariam) base sur les features TF-IDF de Mohammed Hedda (jobs/ml/features.py).
+"""
 import os
-from pyspark.ml import Pipeline
-from pyspark.ml.feature import RegexTokenizer, StopWordsRemover, HashingTF, IDF
+import sys
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
 from pyspark.ml.classification import LogisticRegression
 from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
-from pyspark.sql.functions import explode, concat_ws, coalesce, lit, col, array_contains, count
+from pyspark.sql.functions import col, array_contains
 from common import get_spark, SILVER, GOLD
+from ml.features import prepare_ml_data, save_features_and_pipeline
 
 N_TAGS = int(os.getenv("N_TAGS", "10"))
 spark = get_spark("train_model")
 
-q = spark.read.format("hudi").option("hoodie.metadata.enable", "false").load(SILVER)
-top_tags = [r["tag"] for r in
-            q.select(explode("tags").alias("tag")).groupBy("tag").agg(count("*").alias("n"))
-             .orderBy(col("n").desc()).limit(N_TAGS).collect()]
-print("Tags modelises :", top_tags)
+# 1. Lecture de Silver
+try:
+    q = spark.read.format("hudi").option("hoodie.metadata.enable", "false").load(SILVER)
+except Exception:
+    q = spark.read.parquet(SILVER)
 
-df = q.select("id", concat_ws(" ", coalesce(col("title"), lit("")), coalesce(col("body_text"), lit(""))).alias("text"), "tags")
-train, test = df.randomSplit([0.8, 0.2], seed=42)
+# 2. Utilisation du module features de Hedda
+fitted_pipeline, top_tags, train_f, test_f = prepare_ml_data(q, n_tags=N_TAGS, train_ratio=0.8, seed=42)
+train_f = train_f.cache()
+test_f = test_f.cache()
 
-prep = Pipeline(stages=[
-    RegexTokenizer(inputCol="text", outputCol="tokens", pattern="\\W+", minTokenLength=2),
-    StopWordsRemover(inputCol="tokens", outputCol="clean"),
-    HashingTF(inputCol="clean", outputCol="tf", numFeatures=1 << 14),
-    IDF(inputCol="tf", outputCol="features"),
-]).fit(train)
-train_f = prep.transform(train).cache()
-test_f = prep.transform(test).cache()
+# Sauvegarde des features dans MinIO pour streaming et reproductibilite
+save_features_and_pipeline(spark, fitted_pipeline, top_tags, train_f, test_f)
 
+# 3. Entrainement One-vs-Rest par Mariam
+print(f"\nEntrainement des modeles de regression logistique pour les {len(top_tags)} tags...")
 auc_eval = BinaryClassificationEvaluator(metricName="areaUnderROC")
 f1_eval = MulticlassClassificationEvaluator(metricName="f1")
 
@@ -42,10 +47,11 @@ for tag in top_tags:
     except Exception as e:
         print(f"Tag {tag} ignore : {e}")
         auc, f1 = None, None
-    rows.append((tag, int(tr.filter("label = 1").count()), auc, f1))
-    print(f"{tag}: AUC={auc} F1={f1}")
+    n_pos = int(tr.filter("label = 1").count())
+    rows.append((tag, n_pos, auc, f1))
+    print(f"{tag}: {n_pos} exemples positifs | AUC={auc:.4f} | F1={f1:.4f}")
 
-spark.createDataFrame(rows, "tag string, nb_train_positifs int, auc double, f1 double") \
-    .write.mode("overwrite").parquet(f"{GOLD}/model_metrics")
-print("MODELE OK : metriques ecrites dans gold/model_metrics")
+metrics_df = spark.createDataFrame(rows, "tag string, nb_train_positifs int, auc double, f1 double")
+metrics_df.write.mode("overwrite").parquet(f"{GOLD}/model_metrics")
+print(f"\nMODELE OK : metriques ecrites dans {GOLD}/model_metrics")
 spark.stop()
