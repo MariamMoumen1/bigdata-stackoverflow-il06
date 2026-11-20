@@ -24,12 +24,12 @@ except Exception:
     q = spark.read.parquet(SILVER)
 
 # 2. Utilisation du module features de Hedda
-fitted_pipeline, top_tags, train_f, test_f = prepare_ml_data(q, n_tags=N_TAGS, train_ratio=0.8, seed=42)
+fitted_pipeline, top_tags, train_f, test_f, sample_f = prepare_ml_data(q, n_tags=N_TAGS, train_ratio=0.8, seed=42)
 train_f = train_f.cache()
 test_f = test_f.cache()
 
-# Sauvegarde des features dans MinIO pour streaming et reproductibilite
-save_features_and_pipeline(spark, fitted_pipeline, top_tags, train_f, test_f)
+# Sauvegarde des features dans MinIO pour streaming et reproductibilite (dont le sample Phase 2)
+save_features_and_pipeline(spark, fitted_pipeline, top_tags, train_f, test_f, sample_features=sample_f)
 
 # 3. Entrainement One-vs-Rest par Mariam
 print(f"\nEntrainement des modeles de regression logistique pour les {len(top_tags)} tags...")

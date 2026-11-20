@@ -129,18 +129,20 @@ def prepare_ml_data(
     df: DataFrame,
     n_tags: int = 20,
     train_ratio: float = 0.8,
-    seed: int = 42
-) -> Tuple[PipelineModel, List[str], DataFrame, DataFrame]:
+    seed: int = 42,
+    sample_size: int = 2000
+) -> Tuple[PipelineModel, List[str], DataFrame, DataFrame, DataFrame]:
     """Prepare les donnees pour le Machine Learning.
 
     1. Selectionne les N tags les plus frequents.
     2. S'assure que la colonne unifiee 'text' est presente.
-    3. Separe le jeu de donnees en train (80%) et test (20%).
-    4. Ajuste (fit) le pipeline TF-IDF sur le jeu d'entrainement uniquement.
-    5. Transforme train et test en generant les colonnes 'features'.
+    3. Cree un jeu d'essai reduit (~2000 questions) pour la Phase 2 (deblocage de Mariam pour le streaming).
+    4. Separe le jeu de donnees en train (80%) et test (20%).
+    5. Ajuste (fit) le pipeline TF-IDF sur le jeu d'entrainement uniquement.
+    6. Transforme train, test et le jeu d'essai en generant les colonnes 'features'.
 
     Retourne :
-    - (fitted_pipeline, top_tags, train_features, test_features)
+    - (fitted_pipeline, top_tags, train_features, test_features, sample_features)
     """
     top_tags = get_top_tags(df, n_tags=n_tags)
     print(f"Top {len(top_tags)} tags retenus pour la modelisation : {top_tags}")
@@ -153,13 +155,18 @@ def prepare_ml_data(
         )
 
     # Filtrer les questions qui possedent au moins un tag parmi les tags cibles
-    # Cela garantit que chaque observation a un interet pour l'apprentissage multi-etiquette
     condition = array_contains("tags", top_tags[0])
     for tag in top_tags[1:]:
         condition = condition | array_contains("tags", tag)
     df_filtered = df.filter(condition).select("id", "text", "tags")
 
-    print(f"Questions contenant au moins un des top tags : {df_filtered.count()}")
+    total_filtered = df_filtered.count()
+    print(f"Questions contenant au moins un des top tags : {total_filtered}")
+
+    # Jeu d'essai d'environ 2 000 questions (Phase 2 du contrat Hedda / Mariam)
+    sample_n = min(sample_size, total_filtered)
+    sample_df = df_filtered.limit(sample_n)
+    print(f"Generation du jeu d'essai Phase 2 : {sample_n} questions...")
 
     # Partitionnement Train (80%) / Test (20%) reproductible
     train_df, test_df = df_filtered.randomSplit([train_ratio, 1.0 - train_ratio], seed=seed)
@@ -174,12 +181,13 @@ def prepare_ml_data(
     print("Ajustement (fit) du pipeline TF-IDF sur le jeu train...")
     fitted_pipeline = pipeline.fit(train_df)
 
-    # Transformation des deux jeux de donnees
-    print("Transformation de train et test...")
+    # Transformation des jeux de donnees
+    print("Transformation de train, test et du jeu d'essai...")
     train_features = fitted_pipeline.transform(train_df).select("id", "tags", "features")
     test_features = fitted_pipeline.transform(test_df).select("id", "tags", "features")
+    sample_features = fitted_pipeline.transform(sample_df).select("id", "tags", "features")
 
-    return fitted_pipeline, top_tags, train_features, test_features
+    return fitted_pipeline, top_tags, train_features, test_features, sample_features
 
 
 def save_features_and_pipeline(
@@ -188,6 +196,7 @@ def save_features_and_pipeline(
     top_tags: List[str],
     train_features: DataFrame,
     test_features: DataFrame,
+    sample_features: DataFrame = None,
     output_base: str = f"{GOLD}/ml",
     model_export_path: str = "s3a://models/tfidf_pipeline"
 ) -> Dict[str, str]:
@@ -198,6 +207,7 @@ def save_features_and_pipeline(
     2. Tags retenus : {output_base}/top_tags
     3. Features train : {output_base}/train_features
     4. Features test  : {output_base}/test_features
+    5. Features essai (~2000 questions) : {output_base}/sample_features
     """
     paths = {}
 
@@ -230,6 +240,13 @@ def save_features_and_pipeline(
     test_features.write.mode("overwrite").parquet(test_path)
     paths["test_features"] = test_path
 
+    # 4. Sauvegarde du jeu d'essai Phase 2 (~2000 questions)
+    if sample_features is not None:
+        sample_path = f"{output_base}/sample_features"
+        print(f"Sauvegarde du jeu d'essai Phase 2 (~2000 questions) dans {sample_path}...")
+        sample_features.write.mode("overwrite").parquet(sample_path)
+        paths["sample_features"] = sample_path
+
     return paths
 
 
@@ -261,17 +278,20 @@ def run_features_job():
         silver_df = spark.read.parquet(SILVER)
 
     # Preparation et vectorisation
-    fitted_pipeline, top_tags, train_features, test_features = prepare_ml_data(
+    fitted_pipeline, top_tags, train_features, test_features, sample_features = prepare_ml_data(
         silver_df,
         n_tags=n_tags,
         train_ratio=0.8,
-        seed=42
+        seed=42,
+        sample_size=2000
     )
 
     n_train = train_features.count()
     n_test = test_features.count()
+    n_sample = sample_features.count()
     print(f"Jeu Train : {n_train} observations vectorisees")
     print(f"Jeu Test  : {n_test} observations vectorisees")
+    print(f"Jeu Essai Phase 2 : {n_sample} observations vectorisees (pour debloquer Mariam)")
 
     # Exemple de vecteur TF-IDF
     print("\nExemple de vecteur TF-IDF extrait (premier document train) :")
@@ -287,7 +307,8 @@ def run_features_job():
         fitted_pipeline=fitted_pipeline,
         top_tags=top_tags,
         train_features=train_features,
-        test_features=test_features
+        test_features=test_features,
+        sample_features=sample_features
     )
 
     print("\n" + "=" * 70)

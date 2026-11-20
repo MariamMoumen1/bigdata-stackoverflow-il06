@@ -7,9 +7,27 @@
 
 ---
 
-## 1. Vue d'ensemble de la couche
+## 1. Vue d'ensemble et répartition des 6 tâches Spark
 
-Cette couche constitue le cœur du traitement analytique et prédictif de la plateforme Big Data. Elle intervient à trois moments clés du cycle de vie de la donnée :
+Document de référence : *« Couche Spark : répartition Hedda / Mariam (14 nov. 2026) »*.
+
+### Répartition officielle des 6 tâches Spark
+
+| # | Tâche | Qui | Dossier | Difficulté |
+|---|---|---|---|---|
+| **1** | **Fonction de nettoyage `clean_questions(df)`** (HTML, minuscules, titre + corps, tags en liste, doublons) | **Hedda** | `jobs/transform/` | **Moyenne** |
+| **2** | **Requêtes Spark SQL** : volume par tag et par mois (Gold), classement, croissance mensuelle | **Hedda** | `jobs/sql/` | **Moyenne** |
+| **3** | **Pipeline MLlib** : Tokenizer, StopWordsRemover, TF-IDF, limité aux tags les plus fréquents | **Hedda** | `jobs/ml/features.py` | **Difficile** |
+| 4 | One-vs-Rest multi-étiquettes : un classifieur binaire (régression logistique) par tag, seuil de probabilité | Mariam | `jobs/ml/train.py` | Difficile |
+| 5 | Évaluation (précision, rappel, F1) et sauvegarde du modèle dans MinIO | Mariam | `jobs/ml/evaluate.py` | Moyenne |
+| 6 | Job Structured Streaming : lit Kafka, prédit les tags en continu | Mariam | `jobs/streaming/` | Difficile |
+
+*Bilan :* Hedda a 2 tâches moyennes et 1 difficile ; Mariam a 1 tâche moyenne et 2 difficiles.
+
+### Ordre de travail en 3 phases
+1. **Phase 1 :** Valider ensemble le format des features (colonnes `id`, `tags`, `features`, chemins MinIO).
+2. **Phase 2 :** **Hedda fournit un petit jeu de features d'essai (~2 000 questions)** dans `s3a://gold/ml/sample_features` pour que Mariam puisse tester et écrire le streaming (6) avec un modèle factice sans attendre les 50 000 questions.
+3. **Phase 3 :** Mariam entraîne One-vs-Rest (4) sur les features de Hedda, évalue (5), puis branche le vrai modèle dans le streaming (6). Hedda ayant finalisé son lot en avance, le support pour le streaming (`jobs/streaming/stream_predict.py`) et l'entraînement modulaire a également été préparé.
 
 ```
 Kafka ─► Bronze (Parquet) ─► [Tâche 1 : clean_questions] ─► Silver (Hudi)
@@ -18,13 +36,14 @@ Kafka ─► Bronze (Parquet) ─► [Tâche 1 : clean_questions] ─► Silver 
                  ▼                                                                        ▼
    [Tâche 2 : Spark SQL (Gold)]                                            [Tâche 3 : MLlib Features (TF-IDF)]
                  │                                                                        │
-        ┌────────┴────────┐                                                      ┌────────┴────────┐
-        ▼                 ▼                                                      ▼                 ▼
-Hudi Gold           Parquet Gold                                            Modèle Pipeline     Jeux vectorisés
-(tag_trends_hudi)   (top_tags, tag_trends)                                  (s3a://models/)     (train/test_features)
-        │                 │                                                                        │
-        ▼                 ▼                                                                        ▼
-  Lakehouse Yassien  Dashboard Hasnaoui                                                     Entraînement Mariam
+        ┌────────┴────────┐                                              ┌────────────────┼────────────────┐
+        ▼                 ▼                                              ▼                ▼                ▼
+Hudi Gold           Parquet Gold                                    Pipeline TF-IDF  Train/Test Features  Jeu d'essai ~2000 q.
+(tag_trends_hudi)   (top_tags, tag_trends)                          (s3a://models/)  (s3a://gold/ml/)     (Phase 2 Mariam)
+        │                 │                                              │                │                │
+        ▼                 ▼                                              └────────────────┼────────────────┘
+  Lakehouse Yassien  Dashboard Hasnaoui                                                   ▼
+                                                                             Tâches 4, 5, 6 (Mariam)
 ```
 
 ---
@@ -36,7 +55,7 @@ Hudi Gold           Parquet Gold                                            Mod�
 | **Hedda (Tâche 1)** | **Yassien (Silver)** | Fonction `clean_questions(df)` dans `jobs/transform/cleaning.py`. Reçoit le DataFrame Bronze (champs `id`, `owner_user_id`, `creation_date`, `score`, `title`, `body`, `tags`, `kafka_ts`), élimine les doublons d'id, nettoie le HTML et les tags, et produit le schéma prêt pour l'upsert Hudi. |
 | **Hedda (Tâche 2)** | **Yassien (Gold)** | Table Gold Hudi `tag_trends_hudi` dans `s3a://gold/tag_trends_hudi`, avec clé composite `tag_month_id = tag\|year_month`, pré-combinaison `updated_at`, partitionnée par `year_month` via `hudi_utils.write_hudi`. |
 | **Hedda (Tâche 2)** | **Hasnaoui (Dashboard)** | Tables Parquet dans `s3a://gold/` : `top_tags` (avec `tag`, `nb_questions`, `avg_score`, `global_rank`) et `tag_trends` (avec `year_month`, `tag`, `nb_questions`, `avg_score`, `growth_rate_pct`, `rank_in_month`). |
-| **Hedda (Tâche 3)** | **Mariam (ML & Streaming)** | Pipeline TF-IDF ajusté sauvegardé dans `s3a://models/tfidf_pipeline`, liste des top tags dans `s3a://gold/ml/top_tags`, et DataFrames train/test vectorisés dans `s3a://gold/ml/train_features` et `test_features`. |
+| **Hedda (Tâche 3)** | **Mariam (ML & Streaming)** | **Contrat Tâches 3 & 4 :** Hedda dépose dans MinIO :<br>1. Vecteur TF-IDF (`features`), liste des tags (`tags`) et `id`.<br>2. Liste des N tags retenus (`s3a://gold/ml/top_tags`).<br>3. Jeux séparés entraînement et test (`s3a://gold/ml/train_features` et `test_features`).<br>4. **Jeu d'essai Phase 2** (~2 000 questions dans `s3a://gold/ml/sample_features`).<br>5. Pipeline TF-IDF ajusté (`s3a://models/tfidf_pipeline`) pour le Structured Streaming.<br>Mariam part de ces fichiers sans dépendre du reste du code de Hedda. |
 
 ---
 
