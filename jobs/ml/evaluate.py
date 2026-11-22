@@ -1,68 +1,82 @@
-"""Tache 5 : Evaluation multi-metriques et rapport global (Mariam Moumen).
-Evalue les modeles One-vs-Rest sur le jeu de test de Hedda (s3a://gold/ml/test_features).
-Calcule Precision, Rappel, F1-Score et AUC pour chaque tag, puis sauvegarde dans s3a://gold/model_metrics.
+"""Tache 5 : evaluation (precision, rappel, F1, AUC) et sauvegarde des metriques dans MinIO.
+Responsable : Mariam Moumen.
+Recharge depuis MinIO les modeles sauvegardes par ml/train.py (preuve de la sauvegarde),
+les evalue sur le jeu de test, et ecrit s3a://gold/model_metrics.
+Precision, rappel et F1 sont calcules par tag a partir de tp, fp, fn (pas les metriques
+ponderees de Spark, gonflees pour les tags rares).
 """
-
-import sys
 import os
+import sys
 
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 JOBS_DIR = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 if JOBS_DIR not in sys.path:
     sys.path.insert(0, JOBS_DIR)
 
-from pyspark.sql.functions import col, array_contains
 from pyspark.ml.classification import LogisticRegressionModel
-from pyspark.ml.evaluation import (
-    BinaryClassificationEvaluator,
-    MulticlassClassificationEvaluator,
-)
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.sql import functions as F
 from common import get_spark, GOLD
 
-spark = get_spark("evaluate_models")
-print("=" * 70)
-print("TACHE 5 : EVALUATION DES MODELES (PRECISION, RAPPEL, F1, AUC) - MARIAM")
-print("=" * 70)
+MODELS_INDEX = f"{GOLD}/models_index"
+METRICS = f"{GOLD}/model_metrics"
 
-test_path = f"{GOLD}/ml/test_features"
-tags_path = f"{GOLD}/ml/top_tags"
-MODELS_DIR = "s3a://models/ovr"
 
-print(f"Lecture du jeu de test vectorise depuis {test_path}...")
-test_df = spark.read.parquet(test_path).cache()
+def _fmt(x):
+    return "n/a" if x is None else f"{x:.4f}"
 
-top_tags = [r["tag"] for r in spark.read.parquet(tags_path).orderBy("rank").collect()]
 
-auc_eval = BinaryClassificationEvaluator(labelCol="label", metricName="areaUnderROC")
-f1_eval = MulticlassClassificationEvaluator(labelCol="label", metricName="f1")
-precision_eval = MulticlassClassificationEvaluator(labelCol="label", metricName="weightedPrecision")
-recall_eval = MulticlassClassificationEvaluator(labelCol="label", metricName="weightedRecall")
+def evaluate_models(spark, test_df):
+    """Evalue chaque modele sur le jeu de test et sauvegarde les metriques."""
+    index = spark.read.parquet(MODELS_INDEX).orderBy("rank").collect()
+    auc_eval = BinaryClassificationEvaluator(metricName="areaUnderROC")
+    print(f"\nEvaluation de {len(index)} modeles sur le jeu de test")
 
-metrics_rows = []
+    rows = []
+    for r in index:
+        tag, path = r["tag"], r["model_path"]
+        precision = recall = f1 = auc = tp = fp = fn = None
+        try:
+            if path is None:
+                raise ValueError("pas de modele pour ce tag")
+            model = LogisticRegressionModel.load(path)
+            te = test_df.withColumn("label", F.array_contains("tags", tag).cast("double"))
+            pred = model.transform(te)
+            c = pred.agg(
+                F.sum(F.when((F.col("label") == 1.0) & (F.col("prediction") == 1.0), 1).otherwise(0)).alias("tp"),
+                F.sum(F.when((F.col("label") == 0.0) & (F.col("prediction") == 1.0), 1).otherwise(0)).alias("fp"),
+                F.sum(F.when((F.col("label") == 1.0) & (F.col("prediction") == 0.0), 1).otherwise(0)).alias("fn"),
+            ).first()
+            tp, fp, fn = int(c["tp"] or 0), int(c["fp"] or 0), int(c["fn"] or 0)
+            precision = tp / (tp + fp) if (tp + fp) else 0.0
+            recall = tp / (tp + fn) if (tp + fn) else 0.0
+            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
+            auc = float(auc_eval.evaluate(pred))
+        except Exception as e:
+            print(f"Tag {tag} ignore : {e}")
+        rows.append((tag, path, r["nb_train_positifs"], r["threshold"], precision, recall, f1, auc, tp, fp, fn))
+        print(f"{tag}: {r['nb_train_positifs']} positifs | P={_fmt(precision)} R={_fmt(recall)} F1={_fmt(f1)} AUC={_fmt(auc)}")
 
-for tag in top_tags:
-    model_path = f"{MODELS_DIR}/{tag}"
-    try:
-        model = LogisticRegressionModel.load(model_path)
-        labeled_test = test_df.withColumn("label", array_contains("tags", tag).cast("double"))
-        preds = model.transform(labeled_test)
+    schema = ("tag string, model_path string, nb_train_positifs int, threshold double, precision double, "
+              "recall double, f1 double, auc double, tp long, fp long, fn long")
+    spark.createDataFrame(rows, schema).write.mode("overwrite").parquet(METRICS)
 
-        auc = float(auc_eval.evaluate(preds))
-        f1 = float(f1_eval.evaluate(preds))
-        precision = float(precision_eval.evaluate(preds))
-        recall = float(recall_eval.evaluate(preds))
-        nb_pos = int(labeled_test.filter("label = 1").count())
+    ok = [x for x in rows if x[6] is not None]
+    if ok:
+        n = len(ok)
+        print(f"\nMoyenne (macro) sur {n} tags : P={sum(x[4] for x in ok)/n:.4f} R={sum(x[5] for x in ok)/n:.4f} "
+              f"F1={sum(x[6] for x in ok)/n:.4f} AUC={sum(x[7] for x in ok)/n:.4f}")
+    print(f"EVALUATION OK : metriques ecrites dans {METRICS}")
+    return rows
 
-        metrics_rows.append((tag, nb_pos, auc, precision, recall, f1))
-        print(f"Tag: {tag:<15} | AUC: {auc:.4f} | Prec: {precision:.4f} | Rappel: {recall:.4f} | F1: {f1:.4f}")
-    except Exception as e:
-        print(f"Impossible d'evaluer '{tag}' ({e})")
 
-# Sauvegarde des metriques pour le Dashboard Streamlit
-schema = "tag string, nb_test_positifs int, auc double, precision double, rappel double, f1 double"
-metrics_df = spark.createDataFrame(metrics_rows, schema)
+def main():
+    """Lancement autonome : lit le jeu de test de Hedda deja sauvegarde dans MinIO."""
+    spark = get_spark("evaluate_models")
+    test_df = spark.read.parquet(f"{GOLD}/ml/test_features").cache()
+    evaluate_models(spark, test_df)
+    spark.stop()
 
-output_metrics_path = f"{GOLD}/model_metrics"
-metrics_df.write.mode("overwrite").parquet(output_metrics_path)
-print(f"\nTACHE 5 TERMINEE : Metriques sauvegardees dans {output_metrics_path} pour le dashboard.")
-spark.stop()
+
+if __name__ == "__main__":
+    main()
