@@ -21,16 +21,9 @@ services:
       - kafka_data:/var/lib/kafka/data
 
   minio:
-    image: alpine:3.19
+    image: pgsty/silo:latest
     container_name: minio
-    command: >
-      /bin/sh -c "
-      if [ ! -f /usr/local/bin/minio ]; then
-        wget -q -O /usr/local/bin/minio https://dl.min.io/server/minio/release/linux-amd64/minio &&
-        chmod +x /usr/local/bin/minio;
-      fi &&
-      /usr/local/bin/minio server /data --console-address ':9001'
-      "
+    command: server /data --console-address ":9001"
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -41,19 +34,18 @@ services:
       - minio_data:/data
 
   minio-init:
-    image: alpine:3.19
+    image: amazon/aws-cli:latest
     depends_on:
       - minio
     restart: "no"
     environment:
-      MINIO_USER: ${MINIO_USER}
-      MINIO_PASSWORD: ${MINIO_PASSWORD}
+      AWS_ACCESS_KEY_ID: ${MINIO_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_PASSWORD}
+      AWS_DEFAULT_REGION: us-east-1
     entrypoint: >
       /bin/sh -c "
-      wget -q -O /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc &&
-      chmod +x /usr/local/bin/mc &&
-      until /usr/local/bin/mc alias set local http://minio:9000 $$MINIO_USER $$MINIO_PASSWORD; do sleep 2; done;
-      /usr/local/bin/mc mb -p local/bronze local/silver local/gold;
+      until aws --endpoint-url http://minio:9000 s3 ls; do sleep 2; done;
+      for b in bronze silver gold; do aws --endpoint-url http://minio:9000 s3 mb s3://$$b || true; done;
       exit 0;
       "
 

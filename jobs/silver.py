@@ -1,7 +1,17 @@
-"""SILVER : parse le JSON, nettoie le HTML, dedoublonne et fait un UPSERT dans une table Apache Hudi."""
-from pyspark.sql.functions import from_json, col, to_timestamp, regexp_replace, date_format, size
+"""SILVER : parse le JSON, applique le nettoyage de Hedda, et fait un UPSERT dans Apache Hudi.
+Utilise clean_questions (jobs/transform/cleaning.py).
+"""
+import sys
+import os
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+from pyspark.sql.functions import from_json, col
 from pyspark.sql.types import StructType, StructField, LongType, StringType, ArrayType, IntegerType
 from common import get_spark, BRONZE, SILVER
+from transform.cleaning import clean_questions
 
 spark = get_spark("silver_hudi")
 
@@ -18,15 +28,7 @@ schema = StructType([
 bronze = spark.read.parquet(BRONZE)
 parsed = bronze.select(from_json(col("json"), schema).alias("d"), "kafka_ts").select("d.*", "kafka_ts")
 
-clean = (
-    parsed.dropna(subset=["id"])
-    .withColumn("creation_ts", to_timestamp("creation_date"))
-    .withColumn("body_text", regexp_replace("body", "<[^>]+>", " "))
-    .withColumn("year_month", date_format("creation_ts", "yyyy-MM"))
-    .withColumn("n_tags", size("tags"))
-    .drop("body")
-    .dropDuplicates(["id"])
-)
+clean = clean_questions(parsed)
 
 hudi_options = {
     "hoodie.table.name": "questions_silver",
@@ -34,7 +36,8 @@ hudi_options = {
     "hoodie.datasource.write.recordkey.field": "id",
     "hoodie.datasource.write.precombine.field": "kafka_ts",
     "hoodie.datasource.write.operation": "upsert",
-    "hoodie.datasource.write.keygenerator.class": "org.apache.hudi.keygen.NonpartitionedKeyGenerator",
+    "hoodie.datasource.write.partitionpath.field": "year_month",
+    "hoodie.datasource.write.hive_style_partitioning": "true",
     "hoodie.upsert.shuffle.parallelism": "4",
     "hoodie.insert.shuffle.parallelism": "4",
     "hoodie.metadata.enable": "false",
