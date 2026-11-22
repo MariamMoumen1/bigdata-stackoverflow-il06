@@ -34,7 +34,7 @@ from common import get_spark, KAFKA, GOLD
 TOPIC = os.getenv("KAFKA_TOPIC", "questions")
 ONCE = os.getenv("STREAM_ONCE") == "1"
 OFFSETS = os.getenv("STREAM_OFFSETS", "earliest" if ONCE else "latest")
-THRESHOLD = float(os.getenv("STREAM_THRESHOLD", "0.5"))
+THRESHOLD = float(os.getenv("STREAM_THRESHOLD", os.getenv("PREDICTION_THRESHOLD", "0.5")))
 RUN_ID = os.getenv("STREAM_RUN", "v1")
 MAX_PER_BATCH = os.getenv("STREAM_MAX_OFFSETS", "2000")
 
